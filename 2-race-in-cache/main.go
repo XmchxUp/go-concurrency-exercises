@@ -10,6 +10,7 @@ package main
 
 import (
 	"container/list"
+	"hash/fnv"
 	"sync"
 	"testing"
 )
@@ -28,52 +29,96 @@ type page struct {
 	Value string
 }
 
-// KeyStoreCache is a LRU cache for string key-value pairs
-type KeyStoreCache struct {
+type shard struct {
 	cache map[string]*list.Element
-	pages list.List
-	load  func(string) string
 	mu    sync.RWMutex
+	pages list.List
 }
 
-// New creates a new KeyStoreCache
-func New(load KeyStoreCacheLoader) *KeyStoreCache {
-	return &KeyStoreCache{
-		load:  load.Load,
+// KeyStoreCache is a LRU cache for string key-value pairs
+type KeyStoreCache struct {
+	load      func(string) string
+	shards    []*shard
+	numShards int
+}
+
+func newShard() *shard {
+	return &shard{
 		cache: make(map[string]*list.Element),
 	}
 }
 
+// New creates a new KeyStoreCache
+func New(load KeyStoreCacheLoader) *KeyStoreCache {
+	shards := make([]*shard, 16)
+	for i := 0; i < 16; i++ {
+		shards[i] = newShard()
+	}
+
+	return &KeyStoreCache{
+		load:      load.Load,
+		shards:    shards,
+		numShards: 16,
+	}
+}
+
+// FIXME
+func (k *KeyStoreCache) CacheSize() int {
+	total := 0
+	for _, s := range k.shards {
+		total += len(s.cache)
+	}
+	return total
+}
+
+// FIXME
+func (k *KeyStoreCache) PageSize() int {
+	total := 0
+	for _, s := range k.shards {
+		total += s.pages.Len()
+	}
+	return total
+}
+
+func (k *KeyStoreCache) GetShard(key string) *shard {
+	h := fnv.New32()
+	h.Write([]byte(key))
+	return k.shards[h.Sum32()%uint32(k.numShards)]
+}
+
 // Get gets the key from cache, loads it from the source if needed
 func (k *KeyStoreCache) Get(key string) string {
-	k.mu.RLock()
-	if e, ok := k.cache[key]; ok {
-		k.pages.MoveToFront(e)
-		val := e.Value.(page).Value
-		k.mu.RUnlock()
-		return val
-	}
-	k.mu.RUnlock()
+	s := k.GetShard(key)
 
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	if e, ok := k.cache[key]; ok {
-		k.pages.MoveToFront(e)
+	s.mu.RLock()
+	if e, ok := s.cache[key]; ok {
+		s.pages.MoveToFront(e)
+		value := e.Value.(page).Value
+		s.mu.RUnlock()
+		return value
+	}
+	s.mu.RUnlock()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if e, ok := s.cache[key]; ok {
+		s.pages.MoveToFront(e)
 		return e.Value.(page).Value
 	}
 
 	// Miss - load from database and save it in cache
 	p := page{key, k.load(key)}
 	// if cache is full remove the least used item
-	if len(k.cache) >= CacheSize {
-		end := k.pages.Back()
+	if len(s.cache) >= CacheSize {
+		end := s.pages.Back()
 		// remove from map
-		delete(k.cache, end.Value.(page).Key)
+		delete(s.cache, end.Value.(page).Key)
 		// remove from list
-		k.pages.Remove(end)
+		s.pages.Remove(end)
 	}
-	k.pages.PushFront(p)
-	k.cache[key] = k.pages.Front()
+
+	s.pages.PushFront(p)
+	s.cache[key] = s.pages.Front()
 	return p.Value
 }
 
