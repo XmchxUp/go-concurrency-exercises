@@ -13,10 +13,41 @@
 
 package main
 
+import (
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
+)
+
 func main() {
 	// Create a process
 	proc := MockProcess{}
 
-	// Run the process (blocking)
-	proc.Run()
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+		// Run the process (blocking)
+		proc.Run()
+	}()
+
+	signalCh := make(chan os.Signal, 1)
+	signal.Notify(signalCh, syscall.SIGINT)
+
+	go func() {
+		sigCount := 0
+		for {
+			<-signalCh
+			sigCount++
+			if sigCount == 1 {
+				go proc.Stop()
+			} else if sigCount == 2 {
+				os.Exit(1)
+			}
+		}
+	}()
+
+	wg.Wait()
 }

@@ -20,17 +20,21 @@ package main
 import (
 	"errors"
 	"log"
+	"sync"
+	"time"
 )
 
 // SessionManager keeps track of all sessions from creation, updating
 // to destroying.
 type SessionManager struct {
 	sessions map[string]Session
+	mu       sync.RWMutex
 }
 
 // Session stores the session's data
 type Session struct {
-	Data map[string]interface{}
+	Data        map[string]interface{}
+	LastUpdated time.Time
 }
 
 // NewSessionManager creates a new sessionManager
@@ -39,6 +43,7 @@ func NewSessionManager() *SessionManager {
 		sessions: make(map[string]Session),
 	}
 
+	m.RunSessionCleaner()
 	return m
 }
 
@@ -49,6 +54,8 @@ func (m *SessionManager) CreateSession() (string, error) {
 		return "", err
 	}
 
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.sessions[sessionID] = Session{
 		Data: make(map[string]interface{}),
 	}
@@ -63,6 +70,8 @@ var ErrSessionNotFound = errors.New("SessionID does not exists")
 // GetSessionData returns data related to session if sessionID is
 // found, errors otherwise
 func (m *SessionManager) GetSessionData(sessionID string) (map[string]interface{}, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	session, ok := m.sessions[sessionID]
 	if !ok {
 		return nil, ErrSessionNotFound
@@ -72,17 +81,42 @@ func (m *SessionManager) GetSessionData(sessionID string) (map[string]interface{
 
 // UpdateSessionData overwrites the old session data with the new one
 func (m *SessionManager) UpdateSessionData(sessionID string, data map[string]interface{}) error {
-	_, ok := m.sessions[sessionID]
-	if !ok {
+	m.mu.RLock()
+	if _, ok := m.sessions[sessionID]; !ok {
+		m.mu.RUnlock()
+		return ErrSessionNotFound
+	}
+	m.mu.RUnlock()
+
+	// Hint: you should renew expiry of the session here
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.sessions[sessionID]; !ok {
 		return ErrSessionNotFound
 	}
 
-	// Hint: you should renew expiry of the session here
 	m.sessions[sessionID] = Session{
-		Data: data,
+		Data:        data,
+		LastUpdated: time.Now(),
 	}
 
 	return nil
+}
+
+func (m *SessionManager) RunSessionCleaner() {
+	go func() {
+		for {
+			time.Sleep(5 * time.Second)
+			m.mu.Lock()
+			currentTime := time.Now()
+			for sid, session := range m.sessions {
+				if session.LastUpdated.IsZero() || currentTime.Sub(session.LastUpdated) > 5*time.Second {
+					delete(m.sessions, sid)
+				}
+			}
+			m.mu.Unlock()
+		}
+	}()
 }
 
 func main() {
